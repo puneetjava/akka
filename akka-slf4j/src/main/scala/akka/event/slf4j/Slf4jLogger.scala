@@ -54,11 +54,12 @@ class Slf4jLogger extends Actor with SLF4JLogging {
 
   val mdcThreadAttributeName = "sourceThread"
   val mdcAkkaSourceAttributeName = "akkaSource"
+  val mdcLoggedAtName = "akkaTimestamp"
 
   def receive = {
 
     case event @ Error(cause, logSource, logClass, message) ⇒
-      withMdc(logSource, event.thread.getName) {
+      withMdc(logSource, event) {
         cause match {
           case Error.NoCause | null ⇒ Logger(logClass, logSource).error(if (message != null) message.toString else null)
           case cause                ⇒ Logger(logClass, logSource).error(if (message != null) message.toString else cause.getLocalizedMessage, cause)
@@ -66,13 +67,13 @@ class Slf4jLogger extends Actor with SLF4JLogging {
       }
 
     case event @ Warning(logSource, logClass, message) ⇒
-      withMdc(logSource, event.thread.getName) { Logger(logClass, logSource).warn("{}", message.asInstanceOf[AnyRef]) }
+      withMdc(logSource, event) { Logger(logClass, logSource).warn("{}", message.asInstanceOf[AnyRef]) }
 
     case event @ Info(logSource, logClass, message) ⇒
-      withMdc(logSource, event.thread.getName) { Logger(logClass, logSource).info("{}", message.asInstanceOf[AnyRef]) }
+      withMdc(logSource, event) { Logger(logClass, logSource).info("{}", message.asInstanceOf[AnyRef]) }
 
     case event @ Debug(logSource, logClass, message) ⇒
-      withMdc(logSource, event.thread.getName) { Logger(logClass, logSource).debug("{}", message.asInstanceOf[AnyRef]) }
+      withMdc(logSource, event) { Logger(logClass, logSource).debug("{}", message.asInstanceOf[AnyRef]) }
 
     case InitializeLogger(_) ⇒
       log.info("Slf4jLogger started")
@@ -80,14 +81,14 @@ class Slf4jLogger extends Actor with SLF4JLogging {
   }
 
   @inline
-  final def withMdc(logSource: String, thread: String)(logStatement: ⇒ Unit) {
+  final def withMdc(logSource: String, logEvent: LogEvent)(logStatement: ⇒ Unit) {
     MDC.put(mdcAkkaSourceAttributeName, logSource)
-    MDC.put(mdcThreadAttributeName, thread)
-    try {
-      logStatement
-    } finally {
+    MDC.put(mdcThreadAttributeName, logEvent.thread.getName)
+    MDC.put(mdcLoggedAtName, logEvent.timestamp.toString)
+    try logStatement finally {
       MDC.remove(mdcAkkaSourceAttributeName)
       MDC.remove(mdcThreadAttributeName)
+      MDC.remove(mdcLoggedAtName)
     }
   }
 
