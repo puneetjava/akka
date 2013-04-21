@@ -16,14 +16,11 @@ object TestUtils {
     temporaryServerAddresses(1, address).head
 
   def temporaryServerAddresses(numberOfAddresses: Int, hostname: String = "127.0.0.1"): immutable.IndexedSeq[InetSocketAddress] = {
-    val sockets = for (_ ← 1 to numberOfAddresses) yield {
+    Vector.fill(numberOfAddresses) {
       val serverSocket = ServerSocketChannel.open()
       serverSocket.socket.bind(new InetSocketAddress(hostname, 0))
-      val port = serverSocket.socket.getLocalPort
-      (serverSocket, new InetSocketAddress(hostname, port))
-    }
-
-    sockets collect { case (socket, address) ⇒ socket.close(); address }
+      (serverSocket, serverSocket.socket.getLocalPort)
+    } collect { case (socket, port) ⇒ socket.close(); new InetSocketAddress(hostname, port) }
   }
 
   def verifyActorTermination(actor: ActorRef)(implicit system: ActorSystem): Unit = {
