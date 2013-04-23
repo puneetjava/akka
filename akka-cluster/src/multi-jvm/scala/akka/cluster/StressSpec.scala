@@ -38,6 +38,7 @@ import akka.testkit._
 import akka.testkit.TestEvent._
 import akka.actor.Identify
 import akka.actor.ActorIdentity
+import akka.util.Helpers.Requiring
 
 /**
  * This test is intended to be used as long running stress test
@@ -53,8 +54,20 @@ import akka.actor.ActorIdentity
  * 7. leave and shutdown nodes in various ways
  * 8. while nodes are removed remote death watch is also exercised
  * 9. while nodes are removed a few cluster aware routers are also working
+ *
+ * By default it uses 13 nodes.
+ * Example of sbt command line parameters to double that:
+ * `-DMultiJvm.akka.cluster.Stress.nrOfNodes=26 -Dmultinode.Dakka.test.cluster-stress-spec.nr-of-nodes-factor=2`
  */
 private[cluster] object StressMultiJvmSpec extends MultiNodeConfig {
+
+  val totalNumberOfNodes =
+    System.getProperty("MultiJvm.akka.cluster.Stress.nrOfNodes") match {
+      case null  ⇒ 13
+      case value ⇒ value.toInt requiring (_ >= 10, "nrOfNodes must be >= 10")
+    }
+
+  for (n ← 1 to totalNumberOfNodes) role("node-" + n)
 
   // Note that this test uses default configuration,
   // not MultiNodeClusterSpec.clusterConfig
@@ -62,14 +75,12 @@ private[cluster] object StressMultiJvmSpec extends MultiNodeConfig {
     akka.test.cluster-stress-spec {
       # scale the nr-of-nodes* settings with this factor
       nr-of-nodes-factor = 1
-      nr-of-nodes = 13
       # not scaled
       nr-of-seed-nodes = 3
       nr-of-nodes-joining-to-seed-initally = 2
       nr-of-nodes-joining-one-by-one-small = 2
       nr-of-nodes-joining-one-by-one-large = 2
       nr-of-nodes-joining-to-one = 2
-      nr-of-nodes-joining-to-seed = 2
       nr-of-nodes-leaving-one-by-one-small = 1
       nr-of-nodes-leaving-one-by-one-large = 2
       nr-of-nodes-leaving = 2
@@ -88,6 +99,7 @@ private[cluster] object StressMultiJvmSpec extends MultiNodeConfig {
       high-throughput-duration = 10s
       supervision-duration = 10s
       supervision-one-iteration = 2.5s
+      idle-gossip-duration = 10s
       expected-test-duration = 600s
       # actors are created in a tree structure defined
       # by tree-width (number of children for each actor) and
@@ -98,6 +110,8 @@ private[cluster] object StressMultiJvmSpec extends MultiNodeConfig {
       report-metrics-interval = 10s
       # scale convergence within timeouts with this factor
       convergence-within-factor = 1.0
+      # set to off to only test cluster membership
+      exercise-actors = on
     }
 
     akka.actor.provider = akka.cluster.ClusterActorRefProvider
@@ -109,6 +123,13 @@ private[cluster] object StressMultiJvmSpec extends MultiNodeConfig {
     akka.loggers = ["akka.testkit.TestEventListener"]
     akka.loglevel = INFO
     akka.remote.log-remote-lifecycle-events = off
+
+    #akka.scheduler.tick-duration = 33 ms
+    akka.actor.default-dispatcher.fork-join-executor {
+      parallelism-min = 8
+      parallelism-max = 8
+    }
+
 
     akka.actor.deployment {
       /master-node-1/workers {
@@ -148,14 +169,16 @@ private[cluster] object StressMultiJvmSpec extends MultiNodeConfig {
     private def getDuration(name: String): FiniteDuration = Duration(getMilliseconds(name), MILLISECONDS)
 
     val nFactor = getInt("nr-of-nodes-factor")
-    val totalNumberOfNodes = getInt("nr-of-nodes") * nFactor ensuring (
-      _ >= 10, "nr-of-nodes must be >= 10")
     val numberOfSeedNodes = getInt("nr-of-seed-nodes") // not scaled by nodes factor
     val numberOfNodesJoiningToSeedNodesInitially = getInt("nr-of-nodes-joining-to-seed-initally") * nFactor
     val numberOfNodesJoiningOneByOneSmall = getInt("nr-of-nodes-joining-one-by-one-small") * nFactor
     val numberOfNodesJoiningOneByOneLarge = getInt("nr-of-nodes-joining-one-by-one-large") * nFactor
     val numberOfNodesJoiningToOneNode = getInt("nr-of-nodes-joining-to-one") * nFactor
-    val numberOfNodesJoiningToSeedNodes = getInt("nr-of-nodes-joining-to-seed") * nFactor
+    // remaining will join to seed nodes
+    val numberOfNodesJoiningToSeedNodes = (totalNumberOfNodes - numberOfSeedNodes -
+      numberOfNodesJoiningToSeedNodesInitially - numberOfNodesJoiningOneByOneSmall -
+      numberOfNodesJoiningOneByOneLarge - numberOfNodesJoiningToOneNode) requiring (_ >= 0,
+        s"too many configured nr-of-nodes-joining-*, total must be <= ${totalNumberOfNodes}")
     val numberOfNodesLeavingOneByOneSmall = getInt("nr-of-nodes-leaving-one-by-one-small") * nFactor
     val numberOfNodesLeavingOneByOneLarge = getInt("nr-of-nodes-leaving-one-by-one-large") * nFactor
     val numberOfNodesLeaving = getInt("nr-of-nodes-leaving") * nFactor
@@ -173,11 +196,15 @@ private[cluster] object StressMultiJvmSpec extends MultiNodeConfig {
     val highThroughputDuration = getDuration("high-throughput-duration") * dFactor
     val supervisionDuration = getDuration("supervision-duration") * dFactor
     val supervisionOneIteration = getDuration("supervision-one-iteration") * dFactor
-    val expectedTestDuration = getDuration("expected-test-duration") * dFactor
+    val idleGossipDuration = getDuration("idle-gossip-duration") * dFactor
+    val expectedTestDuration = getDuration("expected-test-duration") * dFactor max
+      (joinRemoveDuration + normalThroughputDuration + highThroughputDuration + supervisionDuration +
+        idleGossipDuration + 5.minutes)
     val treeWidth = getInt("tree-width")
     val treeLevels = getInt("tree-levels")
     val reportMetricsInterval = getDuration("report-metrics-interval")
     val convergenceWithinFactor = getDouble("convergence-within-factor")
+    val exerciseActors = getBoolean("exercise-actors")
 
     require(numberOfSeedNodes + numberOfNodesJoiningToSeedNodesInitially + numberOfNodesJoiningOneByOneSmall +
       numberOfNodesJoiningOneByOneLarge + numberOfNodesJoiningToOneNode + numberOfNodesJoiningToSeedNodes <= totalNumberOfNodes,
@@ -189,10 +216,11 @@ private[cluster] object StressMultiJvmSpec extends MultiNodeConfig {
       s"specified number of leaving/shutdown nodes <= ${totalNumberOfNodes - 3}")
 
     require(numberOfNodesJoinRemove <= totalNumberOfNodes, s"nr-of-nodes-join-remove must be <= ${totalNumberOfNodes}")
-  }
 
-  // FIXME configurable number of nodes
-  for (n ← 1 to 13) role("node-" + n)
+    override def toString: String = {
+      testConfig.root.render
+    }
+  }
 
   implicit class FormattedDouble(val d: Double) extends AnyVal {
     def form: String = d.formatted("%.2f")
@@ -264,7 +292,7 @@ private[cluster] object StressMultiJvmSpec extends MultiNodeConfig {
       (formatMetricsHeader +: (nodeMetrics.toSeq.sortBy(_.address) map formatMetricsLine)).mkString("\n")
     }
 
-    def formatMetricsHeader: String = "Node\tHeap (MB)\tCPU (%)\tLoad"
+    def formatMetricsHeader: String = "[Node]\t[Heap (MB)]\t[CPU (%)]\t[Load]"
 
     def formatMetricsLine(nodeMetrics: NodeMetrics): String = {
       val heap = nodeMetrics match {
@@ -299,14 +327,14 @@ private[cluster] object StressMultiJvmSpec extends MultiNodeConfig {
       }
     }
 
-    def formatPhiHeader: String = "Monitor\tSubject\tcount\tcount phi > 1.0\tmax phi"
+    def formatPhiHeader: String = "[Monitor]\t[Subject]\t[count]\t[count phi > 1.0]\t[max phi]"
 
     def formatPhiLine(monitor: Address, subject: Address, phi: PhiValue): String =
       s"${monitor}\t${subject}\t${phi.count}\t${phi.countAboveOne}\t${phi.max.form}"
 
     def formatStats: String =
       (clusterStatsObservedByNode map { case (monitor, stats) ⇒ s"${monitor}\t${stats}" }).
-        mkString("ClusterStats\n", "\n", "")
+        mkString("ClusterStats(gossip, merge, same, newer, older)\n", "\n", "")
   }
 
   /**
@@ -326,7 +354,7 @@ private[cluster] object StressMultiJvmSpec extends MultiNodeConfig {
     def formatHistory: String =
       (formatHistoryHeader +: (history map formatHistoryLine)).mkString("\n")
 
-    def formatHistoryHeader: String = "title\tduration (ms)\tcluster stats"
+    def formatHistoryHeader: String = "[Title]\t[Duration (ms)]\t[ClusterStats(gossip, merge, same, newer, older)]"
 
     def formatHistoryLine(result: AggregatedClusterResult): String =
       s"${result.title}\t${result.duration.toMillis}\t${result.clusterStats}"
@@ -921,6 +949,7 @@ abstract class StressSpec
   def exerciseRouters(title: String, duration: FiniteDuration, batchInterval: FiniteDuration,
                       expectDroppedMessages: Boolean, tree: Boolean): Unit =
     within(duration + 10.seconds) {
+      nbrUsedRoles must be(totalNumberOfNodes)
       createResultAggregator(title, expectedResults = nbrUsedRoles, includeInHistory = false)
 
       val (masterRoles, otherRoles) = roles.take(nbrUsedRoles).splitAt(3)
@@ -972,30 +1001,40 @@ abstract class StressSpec
       for (count ← 0 until rounds) {
         createResultAggregator(title, expectedResults = nbrUsedRoles, includeInHistory = false)
 
-        reportResult {
-          roles.take(nbrUsedRoles) foreach { r ⇒
-            supervisor ! Props[RemoteChild].withDeploy(Deploy(scope = RemoteScope(address(r))))
-          }
-          supervisor ! GetChildrenCount
-          expectMsgType[ChildrenCount] must be(ChildrenCount(nbrUsedRoles, 0))
-
-          1 to 5 foreach { _ ⇒ supervisor ! new RuntimeException("Simulated exception") }
-          awaitAssert {
+        val (masterRoles, otherRoles) = roles.take(nbrUsedRoles).splitAt(3)
+        runOn(masterRoles: _*) {
+          reportResult {
+            roles.take(nbrUsedRoles) foreach { r ⇒
+              supervisor ! Props[RemoteChild].withDeploy(Deploy(scope = RemoteScope(address(r))))
+            }
             supervisor ! GetChildrenCount
-            val c = expectMsgType[ChildrenCount]
-            c must be(ChildrenCount(nbrUsedRoles, 5 * nbrUsedRoles))
-          }
+            expectMsgType[ChildrenCount] must be(ChildrenCount(nbrUsedRoles, 0))
 
-          // after 5 restart attempts the children should be stopped
-          supervisor ! new RuntimeException("Simulated exception")
-          awaitAssert {
-            supervisor ! GetChildrenCount
-            val c = expectMsgType[ChildrenCount]
-            // zero children
-            c must be(ChildrenCount(0, 6 * nbrUsedRoles))
-          }
-          supervisor ! Reset
+            1 to 5 foreach { _ ⇒ supervisor ! new RuntimeException("Simulated exception") }
+            awaitAssert {
+              supervisor ! GetChildrenCount
+              val c = expectMsgType[ChildrenCount]
+              c must be(ChildrenCount(nbrUsedRoles, 5 * nbrUsedRoles))
+            }
 
+            // after 5 restart attempts the children should be stopped
+            supervisor ! new RuntimeException("Simulated exception")
+            awaitAssert {
+              supervisor ! GetChildrenCount
+              val c = expectMsgType[ChildrenCount]
+              // zero children
+              c must be(ChildrenCount(0, 6 * nbrUsedRoles))
+            }
+            supervisor ! Reset
+
+          }
+          enterBarrier("supervision-done-" + step)
+        }
+
+        runOn(otherRoles: _*) {
+          reportResult {
+            enterBarrier("supervision-done-" + step)
+          }
         }
 
         awaitClusterResult()
@@ -1003,9 +1042,23 @@ abstract class StressSpec
       }
     }
 
+  def idleGossip(title: String): Unit = {
+    createResultAggregator(title, expectedResults = nbrUsedRoles, includeInHistory = true)
+    reportResult {
+      clusterView.members.size must be(nbrUsedRoles)
+      Thread.sleep(idleGossipDuration.toMillis)
+      clusterView.members.size must be(nbrUsedRoles)
+    }
+    awaitClusterResult()
+  }
+
   "A cluster under stress" must {
 
     "join seed nodes" taggedAs LongRunningTest in within(30 seconds) {
+
+      runOn(roles.head) {
+        log.info("StressSpec settings:\n" + settings.toString)
+      }
 
       val otherNodesJoiningSeedNodes = roles.slice(numberOfSeedNodes, numberOfSeedNodes + numberOfNodesJoiningToSeedNodesInitially)
       val size = seedNodes.size + otherNodesJoiningSeedNodes.size
@@ -1026,11 +1079,13 @@ abstract class StressSpec
     }
 
     "start routers that are running while nodes are joining" taggedAs LongRunningTest in {
-      runOn(roles.take(3): _*) {
-        system.actorOf(Props(new Master(settings, settings.workBatchInterval, tree = false)),
-          name = "master-" + myself.name) ! Begin
+      if (exerciseActors) {
+        runOn(roles.take(3): _*) {
+          system.actorOf(Props(new Master(settings, settings.workBatchInterval, tree = false)),
+            name = "master-" + myself.name) ! Begin
+        }
+        enterBarrier("after-" + step)
       }
-      enterBarrier("after-" + step)
     }
 
     "join nodes one-by-one to small cluster" taggedAs LongRunningTest in {
@@ -1045,8 +1100,10 @@ abstract class StressSpec
     }
 
     "join several nodes to seed nodes" taggedAs LongRunningTest in {
-      joinSeveral(numberOfNodesJoiningToOneNode, toSeedNodes = true)
-      nbrUsedRoles += numberOfNodesJoiningToSeedNodes
+      if (numberOfNodesJoiningToSeedNodes > 0) {
+        joinSeveral(numberOfNodesJoiningToSeedNodes, toSeedNodes = true)
+        nbrUsedRoles += numberOfNodesJoiningToSeedNodes
+      }
       enterBarrier("after-" + step)
     }
 
@@ -1056,40 +1113,50 @@ abstract class StressSpec
     }
 
     "end routers that are running while nodes are joining" taggedAs LongRunningTest in within(30.seconds) {
-      runOn(roles.take(3): _*) {
-        val m = master
-        m must not be (None)
-        m.get.tell(End, testActor)
-        val workResult = awaitWorkResult
-        workResult.retryCount must be(0)
-        workResult.sendCount must be > (0L)
-        workResult.ackCount must be > (0L)
+      if (exerciseActors) {
+        runOn(roles.take(3): _*) {
+          val m = master
+          m must not be (None)
+          m.get.tell(End, testActor)
+          val workResult = awaitWorkResult
+          workResult.retryCount must be(0)
+          workResult.sendCount must be > (0L)
+          workResult.ackCount must be > (0L)
+        }
+        enterBarrier("after-" + step)
       }
-      enterBarrier("after-" + step)
     }
 
     "use routers with normal throughput" taggedAs LongRunningTest in {
-      exerciseRouters("use routers with normal throughput", normalThroughputDuration,
-        batchInterval = workBatchInterval, expectDroppedMessages = false, tree = false)
-      enterBarrier("after-" + step)
+      if (exerciseActors) {
+        exerciseRouters("use routers with normal throughput", normalThroughputDuration,
+          batchInterval = workBatchInterval, expectDroppedMessages = false, tree = false)
+        enterBarrier("after-" + step)
+      }
     }
 
     "use routers with high throughput" taggedAs LongRunningTest in {
-      exerciseRouters("use routers with high throughput", highThroughputDuration,
-        batchInterval = Duration.Zero, expectDroppedMessages = false, tree = false)
-      enterBarrier("after-" + step)
+      if (exerciseActors) {
+        exerciseRouters("use routers with high throughput", highThroughputDuration,
+          batchInterval = Duration.Zero, expectDroppedMessages = false, tree = false)
+        enterBarrier("after-" + step)
+      }
     }
 
     "use many actors with normal throughput" taggedAs LongRunningTest in {
-      exerciseRouters("use many actors with normal throughput", normalThroughputDuration,
-        batchInterval = workBatchInterval, expectDroppedMessages = false, tree = true)
-      enterBarrier("after-" + step)
+      if (exerciseActors) {
+        exerciseRouters("use many actors with normal throughput", normalThroughputDuration,
+          batchInterval = workBatchInterval, expectDroppedMessages = false, tree = true)
+        enterBarrier("after-" + step)
+      }
     }
 
     "use many actors with high throughput" taggedAs LongRunningTest in {
-      exerciseRouters("use many actors with high throughput", highThroughputDuration,
-        batchInterval = Duration.Zero, expectDroppedMessages = false, tree = true)
-      enterBarrier("after-" + step)
+      if (exerciseActors) {
+        exerciseRouters("use many actors with high throughput", highThroughputDuration,
+          batchInterval = Duration.Zero, expectDroppedMessages = false, tree = true)
+        enterBarrier("after-" + step)
+      }
     }
 
     "exercise join/remove/join/remove" taggedAs LongRunningTest in {
@@ -1098,16 +1165,25 @@ abstract class StressSpec
     }
 
     "exercise supervision" taggedAs LongRunningTest in {
-      exerciseSupervision("exercise supervision", supervisionDuration, supervisionOneIteration)
+      if (exerciseActors) {
+        exerciseSupervision("exercise supervision", supervisionDuration, supervisionOneIteration)
+        enterBarrier("after-" + step)
+      }
+    }
+
+    "gossip when idle" taggedAs LongRunningTest in {
+      idleGossip("idle gossip")
       enterBarrier("after-" + step)
     }
 
     "start routers that are running while nodes are removed" taggedAs LongRunningTest in {
-      runOn(roles.take(3): _*) {
-        system.actorOf(Props(new Master(settings, settings.workBatchInterval, tree = false)),
-          name = "master-" + myself.name) ! Begin
+      if (exerciseActors) {
+        runOn(roles.take(3): _*) {
+          system.actorOf(Props(new Master(settings, settings.workBatchInterval, tree = false)),
+            name = "master-" + myself.name) ! Begin
+        }
+        enterBarrier("after-" + step)
       }
-      enterBarrier("after-" + step)
     }
 
     "leave nodes one-by-one from large cluster" taggedAs LongRunningTest in {
@@ -1143,15 +1219,17 @@ abstract class StressSpec
     }
 
     "end routers that are running while nodes are removed" taggedAs LongRunningTest in within(30.seconds) {
-      runOn(roles.take(3): _*) {
-        val m = master
-        m must not be (None)
-        m.get.tell(End, testActor)
-        val workResult = awaitWorkResult
-        workResult.sendCount must be > (0L)
-        workResult.ackCount must be > (0L)
+      if (exerciseActors) {
+        runOn(roles.take(3): _*) {
+          val m = master
+          m must not be (None)
+          m.get.tell(End, testActor)
+          val workResult = awaitWorkResult
+          workResult.sendCount must be > (0L)
+          workResult.ackCount must be > (0L)
+        }
+        enterBarrier("after-" + step)
       }
-      enterBarrier("after-" + step)
     }
 
   }
