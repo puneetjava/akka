@@ -188,6 +188,20 @@ trait Conductor { this: TestConductorExt ⇒
   }
 
   /**
+   * Tell the actor system at the remote node to shut itself down. The node will also be
+   * removed, so that the remaining nodes may still pass subsequent barriers.
+   *
+   * @param node is the symbolic name of the node which is to be affected
+   */
+  def shutdown2(node: RoleName): Future[Done] = {
+    import Settings.QueryTimeout
+    import system.dispatcher
+    // the recover is needed to handle ClientDisconnectedException exception,
+    // which is normal during shutdown
+    controller ? Terminate(node, 1) mapTo classTag[Done] recover { case _: ClientDisconnectedException ⇒ Done }
+  }
+
+  /**
    * Obtain the list of remote host names currently registered.
    */
   def getNodes: Future[Iterable[RoleName]] = {

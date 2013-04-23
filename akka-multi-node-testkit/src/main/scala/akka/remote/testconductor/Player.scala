@@ -237,6 +237,9 @@ private[akka] class ClientFSM(name: RoleName, controllerAddr: InetSocketAddress)
           import context.dispatcher // FIXME is this the right EC for the future below?
           // FIXME: Currently ignoring, needs support from Remoting
           stay
+        case TerminateMsg(1) ⇒
+          context.system.shutdown()
+          stay
         case TerminateMsg(exit) ⇒
           System.exit(exit)
           stay // needed because Java doesn’t have Nothing
